@@ -45,19 +45,11 @@ class Sp500RsiProvider(Provider):
         return [obs] if obs else []
 
     def _fetch_best_effort(self) -> Observation | None:
-        # Requested source order (daily RSI intent):
-        # 1) Investing.com
-        # 2) Investtech
-        # 3) TradingView
-        # 4) Stooq daily calc (final emergency fallback only)
-        for fn in (self._fetch_investing, self._fetch_investtech, self._fetch_tradingview, self._fetch_stooq_rsi):
-            try:
-                obs = fn()
-            except Exception:
-                obs = None
-            if obs is not None:
-                return obs
-        return None
+        # User requested strict source: Investing.com Daily RSI(14) Value column.
+        try:
+            return self._fetch_investing()
+        except Exception:
+            return None
 
     def _compute_rsi14(self, closes: list[float]) -> float | None:
         # Wilder RSI(14). Need at least 15 closes.
@@ -96,69 +88,6 @@ class Sp500RsiProvider(Provider):
         text = (resp.text or "").strip()
         if not text or text.lower().startswith("no data"):
             return None
-        deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-        gains = [max(d, 0.0) for d in deltas]
-        losses = [max(-d, 0.0) for d in deltas]
-
-        period = 14
-        avg_gain = sum(gains[:period]) / period
-        avg_loss = sum(losses[:period]) / period
-
-        for i in range(period, len(gains)):
-            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-
-        if avg_loss == 0:
-            return 100.0
-        rs = avg_gain / avg_loss
-        rsi = 100.0 - (100.0 / (1.0 + rs))
-        if 0 <= rsi <= 100:
-            return rsi
-        return None
-
-    def _fetch_stooq_rsi(self) -> Observation | None:
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "text/csv,text/plain,*/*",
-            "Accept-Encoding": "identity",
-        }
-        params = {"s": "^spx", "i": "d"}
-        resp = self.session.get(self.STOOQ_DAILY_URL, params=params, headers=headers, timeout=(5, 12))
-        if resp.status_code >= 400:
-            return None
-        text = (resp.text or "").strip()
-        if not text or text.lower().startswith("no data"):
-            return None
-
-        closes: list[float] = []
-        last_as_of: date | None = None
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        for line in lines[1:]:
-            parts = line.split(",")
-            if len(parts) < 5:
-                continue
-            try:
-                d = date.fromisoformat(parts[0])
-                c = float(parts[4])
-            except Exception:
-                continue
-            last_as_of = d
-            closes.append(c)
-
-        if not last_as_of:
-            return None
-        rsi = self._compute_rsi14(closes)
-        if rsi is None:
-            return None
-
-        return Observation(
-            indicator_id=IndicatorId.SP500_RSI,
-            as_of=last_as_of,
-            value=rsi,
-            unit="0-100",
-            source="Stooq(calc)",
-            meta={"url": self.STOOQ_DAILY_URL, "symbol": "^spx", "method": "wilder_rsi14"},
-        )
 
         closes: list[float] = []
         last_as_of: date | None = None
@@ -386,7 +315,7 @@ class Sp500RsiProvider(Provider):
                 value=v,
                 unit="0-100",
                 source="Investing.com",
-                meta={"url": u, "timeframe": "1D"},
+                meta={"url": u, "timeframe": "1D", "selector": "RSI(14)->Value"},
             )
         return None
 
