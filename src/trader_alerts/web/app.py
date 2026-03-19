@@ -31,7 +31,6 @@ from ..signals import compute_signals
 from ..service import compute_alerts
 from ..storage import (
     list_latest,
-    latest_observation,
     upsert_observations,
     get_last_update_time,
     recent_observations,
@@ -159,10 +158,6 @@ def create_app(
                     obs = Nasdaq100PeProvider().fetch([IndicatorId.NASDAQ100_PE_RATIO])
                 elif name == "rsi":
                     obs = Sp500RsiProvider().fetch([IndicatorId.SP500_RSI])
-                    if not obs:
-                        cached_rsi = latest_observation(resolved_db, IndicatorId.SP500_RSI)
-                        if cached_rsi:
-                            obs = [cached_rsi]
                 elif name == "fred":
                     obs = FredProvider().fetch([IndicatorId.US_HIGH_YIELD_SPREAD])
                 elif name == "http":
@@ -512,5 +507,3 @@ def create_app(
 
 # Create default app instance for uvicorn
 app = create_app()
-
-
