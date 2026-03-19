@@ -38,12 +38,18 @@ class Sp500RsiProvider(Provider):
         return [obs] if obs else []
 
     def _fetch_best_effort(self) -> Observation | None:
-        # Fixed source policy: RSI only from Investing.com.
-        # Do not fall back to other providers to avoid inconsistent cloud values.
-        try:
-            return self._fetch_investing()
-        except Exception:
-            return None
+        # Best-effort fallback chain:
+        # 1) Investing.com (preferred)
+        # 2) Investtech
+        # 3) TradingView
+        for fn in (self._fetch_investing, self._fetch_investtech, self._fetch_tradingview):
+            try:
+                obs = fn()
+            except Exception:
+                obs = None
+            if obs is not None:
+                return obs
+        return None
 
     def _get(self, url: str, *, referer: str | None = None) -> str:
         headers = {
@@ -193,4 +199,3 @@ class Sp500RsiProvider(Provider):
             source="TradingView",
             meta={"url": self.TRADINGVIEW_URL},
         )
-
