@@ -26,7 +26,14 @@ class Sp500RsiProvider(Provider):
 
     INVESTTECH_URL = "https://www.investtech.com/main/market.php?CompanyID=10400521&product=211"
     INVESTING_URL = "https://www.investing.com/indices/us-spx-500-technical"
-    TRADINGVIEW_URL = "https://www.tradingview.com/symbols/SPX/technicals/"
+    # Try explicit daily timeframe variants first.
+    INVESTING_DAILY_URLS = (
+        "https://www.investing.com/indices/us-spx-500-technical?timeFrame=day",
+        "https://www.investing.com/indices/us-spx-500-technical?interval=1day",
+        INVESTING_URL,
+    )
+    TRADINGVIEW_URL = "https://www.tradingview.com/symbols/SPX/technicals/?interval=1D"
+    STOOQ_DAILY_URL = "https://stooq.com/q/d/l/"
 
     def __init__(self, session: requests.Session | None = None):
         self.session = session or requests.Session()
@@ -38,12 +45,79 @@ class Sp500RsiProvider(Provider):
         return [obs] if obs else []
 
     def _fetch_best_effort(self) -> Observation | None:
-        # Fixed source policy: RSI only from Investing.com.
-        # Do not fall back to other providers to avoid inconsistent cloud values.
+        # User requested strict source: Investing.com Daily RSI(14) Value column.
         try:
             return self._fetch_investing()
         except Exception:
             return None
+
+    def _compute_rsi14(self, closes: list[float]) -> float | None:
+        # Wilder RSI(14). Need at least 15 closes.
+        if len(closes) < 15:
+            return None
+        deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+        gains = [max(d, 0.0) for d in deltas]
+        losses = [max(-d, 0.0) for d in deltas]
+
+        period = 14
+        avg_gain = sum(gains[:period]) / period
+        avg_loss = sum(losses[:period]) / period
+
+        for i in range(period, len(gains)):
+            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+        if 0 <= rsi <= 100:
+            return rsi
+        return None
+
+    def _fetch_stooq_rsi(self) -> Observation | None:
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "text/csv,text/plain,*/*",
+            "Accept-Encoding": "identity",
+        }
+        params = {"s": "^spx", "i": "d"}
+        resp = self.session.get(self.STOOQ_DAILY_URL, params=params, headers=headers, timeout=(5, 12))
+        if resp.status_code >= 400:
+            return None
+        text = (resp.text or "").strip()
+        if not text or text.lower().startswith("no data"):
+            return None
+
+        closes: list[float] = []
+        last_as_of: date | None = None
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        for line in lines[1:]:
+            parts = line.split(",")
+            if len(parts) < 5:
+                continue
+            try:
+                d = date.fromisoformat(parts[0])
+                c = float(parts[4])
+            except Exception:
+                continue
+            last_as_of = d
+            closes.append(c)
+
+        if not last_as_of:
+            return None
+        rsi = self._compute_rsi14(closes)
+        if rsi is None:
+            return None
+
+        return Observation(
+            indicator_id=IndicatorId.SP500_RSI,
+            as_of=last_as_of,
+            value=rsi,
+            unit="0-100",
+            source="Stooq(calc)",
+            meta={"url": self.STOOQ_DAILY_URL, "symbol": "^spx", "method": "wilder_rsi14"},
+        )
 
     def _get(self, url: str, *, referer: str | None = None) -> str:
         headers = {
@@ -57,10 +131,27 @@ class Sp500RsiProvider(Provider):
         }
         if referer:
             headers["Referer"] = referer
-        resp = self.session.get(url, headers=headers, timeout=(5, 12))
-        if resp.status_code >= 400:
-            return ""
-        return resp.text or ""
+        try:
+            resp = self.session.get(url, headers=headers, timeout=(5, 12))
+            if resp.status_code < 400:
+                return resp.text or ""
+        except Exception:
+            resp = None
+
+        # Cloud fallback: some deployments run behind outbound proxy/WAF and can get
+        # blocked for Investing while local machine still works. Retry once bypassing
+        # env proxy settings.
+        if "investing.com" in url:
+            try:
+                direct = requests.Session()
+                direct.trust_env = False
+                resp2 = direct.get(url, headers=headers, timeout=(5, 12))
+                if resp2.status_code < 400:
+                    return resp2.text or ""
+            except Exception:
+                pass
+
+        return ""
 
     def _parse_rsi_from_html(self, html: str) -> float | None:
         if not html:
@@ -81,6 +172,52 @@ class Sp500RsiProvider(Provider):
                     return v
         return None
 
+    def _parse_tradingview_rsi14_value(self, html: str) -> tuple[float | None, dict[str, str]]:
+        """
+        TradingView: strictly match the RSI(14) row/value, avoid broad numeric grabs.
+        Returns (value, debug_meta).
+        """
+        if not html:
+            return (None, {"tv_match": "empty_html"})
+
+        patterns: list[tuple[str, str]] = [
+            (
+                "tv_row_td_exact",
+                r"Relative\s+Strength\s+Index\s*\(\s*14\s*\)\s*"
+                r"</[^>]+>\s*"
+                r"<[^>]+>\s*([0-9]{1,3}(?:\.[0-9]+)?)\s*</[^>]+>",
+            ),
+            (
+                "tv_row_rsi14_td",
+                r"RSI\s*\(\s*14\s*\)\s*"
+                r"</[^>]+>\s*"
+                r"<[^>]+>\s*([0-9]{1,3}(?:\.[0-9]+)?)\s*</[^>]+>",
+            ),
+            (
+                "tv_json_title_value",
+                r"Relative\s+Strength\s+Index\s*\(\s*14\s*\).*?"
+                r"(?:\"value\"|value)\s*[:=]\s*\"?([0-9]{1,3}(?:\.[0-9]+)?)\"?",
+            ),
+            (
+                "tv_json_name_value",
+                r"(?:\"name\"|name)\s*[:=]\s*\"?Relative\s+Strength\s+Index\s*\(\s*14\s*\)\"?.*?"
+                r"(?:\"value\"|value)\s*[:=]\s*\"?([0-9]{1,3}(?:\.[0-9]+)?)\"?",
+            ),
+        ]
+
+        for tag, p in patterns:
+            m = re.search(p, html, re.IGNORECASE | re.DOTALL)
+            if not m:
+                continue
+            try:
+                v = float(m.group(1))
+            except Exception:
+                continue
+            if 0 <= v <= 100:
+                return (v, {"tv_match": tag, "tv_value_raw": m.group(1)})
+
+        return (None, {"tv_match": "no_rsi14_row_match"})
+
     def _parse_investing_rsi14_value(self, html: str) -> float | None:
         """
         解析 Investing.com 技术面 “Name / Value / Action” 表格里的 RSI(14) → Value。
@@ -92,18 +229,18 @@ class Sp500RsiProvider(Provider):
         if not html:
             return None
 
-        # 优先：严格匹配整行，避免误抓 RSI(14) 附近其它数字
-        # 典型结构（表格行）：
-        # <td>RSI(14)</td><td>69.858</td><td>Buy</td>
+        # 优先：匹配表格整行，提取 RSI(14) 后第一列 value。
+        # 只要求存在第三列（action）但不强限制其文本，避免页面把 Buy/Sell
+        # 改成 Strong Buy / Strong Sell 后导致解析失效。
+        # 典型结构：
+        # <td>RSI(14)</td><td>69.858</td><td>Strong Buy</td>
         m = re.search(
             r"RSI\s*\(\s*14\s*\)\s*"
             r"</td>\s*"
             r"<td[^>]*>\s*"
             r"([0-9]{1,3}(?:\.[0-9]+)?)\s*"
             r"</td>\s*"
-            r"<td[^>]*>\s*"
-            r"(Buy|Sell|Neutral)\s*"
-            r"</td>",
+            r"<td[^>]*>.*?</td>",
             html,
             re.IGNORECASE | re.DOTALL,
         )
@@ -119,9 +256,7 @@ class Sp500RsiProvider(Provider):
             r"<td[^>]*>.*?"
             r"([0-9]{1,3}(?:\.[0-9]+)?)"
             r".*?</td>\s*"
-            r"<td[^>]*>.*?"
-            r"(Buy|Sell|Neutral)"
-            r".*?</td>",
+            r"<td[^>]*>.*?</td>",
             html,
             re.IGNORECASE | re.DOTALL,
         )
@@ -133,8 +268,7 @@ class Sp500RsiProvider(Provider):
         # 再兜底：如果页面把表格数据塞在脚本 JSON 里（key/value/action）
         m = re.search(
             r"RSI\s*\(\s*14\s*\).*?"
-            r"(?:\"value\"|value|data-value)\s*[:=]\s*\"?([0-9]{1,3}(?:\.[0-9]+)?)\"?.*?"
-            r"(?:\"action\"|action)\s*[:=]\s*\"?(Buy|Sell|Neutral)\"?",
+            r"(?:\"value\"|value|data-value)\s*[:=]\s*\"?([0-9]{1,3}(?:\.[0-9]+)?)\"?",
             html,
             re.IGNORECASE | re.DOTALL,
         )
@@ -165,27 +299,29 @@ class Sp500RsiProvider(Provider):
             value=v,
             unit="0-100",
             source="Investtech",
-            meta={"url": self.INVESTTECH_URL},
+            meta={"url": self.INVESTTECH_URL, "timeframe": "1D"},
         )
 
     def _fetch_investing(self) -> Observation | None:
-        html = self._get(self.INVESTING_URL, referer="https://www.investing.com/")
-        # 只接受 “RSI(14) ... Buy/Sell/Neutral” 这一行里的 Value，避免误抓页面其它数字。
-        v = self._parse_investing_rsi14_value(html)
-        if v is None:
-            return None
-        return Observation(
-            indicator_id=IndicatorId.SP500_RSI,
-            as_of=date.today(),
-            value=v,
-            unit="0-100",
-            source="Investing.com",
-            meta={"url": self.INVESTING_URL},
-        )
+        for u in self.INVESTING_DAILY_URLS:
+            html = self._get(u, referer="https://www.investing.com/")
+            # 只接受 RSI(14) 的 Value
+            v = self._parse_investing_rsi14_value(html)
+            if v is None:
+                continue
+            return Observation(
+                indicator_id=IndicatorId.SP500_RSI,
+                as_of=date.today(),
+                value=v,
+                unit="0-100",
+                source="Investing.com",
+                meta={"url": u, "timeframe": "1D", "selector": "RSI(14)->Value"},
+            )
+        return None
 
     def _fetch_tradingview(self) -> Observation | None:
         html = self._get(self.TRADINGVIEW_URL, referer="https://www.tradingview.com/")
-        v = self._parse_rsi_from_html(html)
+        v, dbg = self._parse_tradingview_rsi14_value(html)
         if v is None:
             return None
         return Observation(
@@ -194,7 +330,5 @@ class Sp500RsiProvider(Provider):
             value=v,
             unit="0-100",
             source="TradingView",
-            meta={"url": self.TRADINGVIEW_URL},
+            meta={"url": self.TRADINGVIEW_URL, "timeframe": "1D", **dbg},
         )
-
-
