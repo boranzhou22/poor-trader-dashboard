@@ -26,7 +26,14 @@ class Sp500RsiProvider(Provider):
 
     INVESTTECH_URL = "https://www.investtech.com/main/market.php?CompanyID=10400521&product=211"
     INVESTING_URL = "https://www.investing.com/indices/us-spx-500-technical"
-    TRADINGVIEW_URL = "https://www.tradingview.com/symbols/SPX/technicals/"
+    # Try explicit daily timeframe variants first.
+    INVESTING_DAILY_URLS = (
+        "https://www.investing.com/indices/us-spx-500-technical?timeFrame=day",
+        "https://www.investing.com/indices/us-spx-500-technical?interval=1day",
+        INVESTING_URL,
+    )
+    TRADINGVIEW_URL = "https://www.tradingview.com/symbols/SPX/technicals/?interval=1D"
+    STOOQ_DAILY_URL = "https://stooq.com/q/d/l/"
 
     def __init__(self, session: requests.Session | None = None):
         self.session = session or requests.Session()
@@ -38,11 +45,12 @@ class Sp500RsiProvider(Provider):
         return [obs] if obs else []
 
     def _fetch_best_effort(self) -> Observation | None:
-        # Best-effort fallback chain:
-        # 1) Investing.com (preferred)
+        # Requested source order (daily RSI intent):
+        # 1) Investing.com
         # 2) Investtech
         # 3) TradingView
-        for fn in (self._fetch_investing, self._fetch_investtech, self._fetch_tradingview):
+        # 4) Stooq daily calc (final emergency fallback only)
+        for fn in (self._fetch_investing, self._fetch_investtech, self._fetch_tradingview, self._fetch_stooq_rsi):
             try:
                 obs = fn()
             except Exception:
@@ -50,6 +58,74 @@ class Sp500RsiProvider(Provider):
             if obs is not None:
                 return obs
         return None
+
+    def _compute_rsi14(self, closes: list[float]) -> float | None:
+        # Wilder RSI(14). Need at least 15 closes.
+        if len(closes) < 15:
+            return None
+        deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+        gains = [max(d, 0.0) for d in deltas]
+        losses = [max(-d, 0.0) for d in deltas]
+
+        period = 14
+        avg_gain = sum(gains[:period]) / period
+        avg_loss = sum(losses[:period]) / period
+
+        for i in range(period, len(gains)):
+            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+        if 0 <= rsi <= 100:
+            return rsi
+        return None
+
+    def _fetch_stooq_rsi(self) -> Observation | None:
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "text/csv,text/plain,*/*",
+            "Accept-Encoding": "identity",
+        }
+        params = {"s": "^spx", "i": "d"}
+        resp = self.session.get(self.STOOQ_DAILY_URL, params=params, headers=headers, timeout=(5, 12))
+        if resp.status_code >= 400:
+            return None
+        text = (resp.text or "").strip()
+        if not text or text.lower().startswith("no data"):
+            return None
+
+        closes: list[float] = []
+        last_as_of: date | None = None
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        for line in lines[1:]:
+            parts = line.split(",")
+            if len(parts) < 5:
+                continue
+            try:
+                d = date.fromisoformat(parts[0])
+                c = float(parts[4])
+            except Exception:
+                continue
+            last_as_of = d
+            closes.append(c)
+
+        if not last_as_of:
+            return None
+        rsi = self._compute_rsi14(closes)
+        if rsi is None:
+            return None
+
+        return Observation(
+            indicator_id=IndicatorId.SP500_RSI,
+            as_of=last_as_of,
+            value=rsi,
+            unit="0-100",
+            source="Stooq(calc)",
+            meta={"url": self.STOOQ_DAILY_URL, "symbol": "^spx", "method": "wilder_rsi14"},
+        )
 
     def _get(self, url: str, *, referer: str | None = None) -> str:
         headers = {
@@ -63,10 +139,27 @@ class Sp500RsiProvider(Provider):
         }
         if referer:
             headers["Referer"] = referer
-        resp = self.session.get(url, headers=headers, timeout=(5, 12))
-        if resp.status_code >= 400:
-            return ""
-        return resp.text or ""
+        try:
+            resp = self.session.get(url, headers=headers, timeout=(5, 12))
+            if resp.status_code < 400:
+                return resp.text or ""
+        except Exception:
+            resp = None
+
+        # Cloud fallback: some deployments run behind outbound proxy/WAF and can get
+        # blocked for Investing while local machine still works. Retry once bypassing
+        # env proxy settings.
+        if "investing.com" in url:
+            try:
+                direct = requests.Session()
+                direct.trust_env = False
+                resp2 = direct.get(url, headers=headers, timeout=(5, 12))
+                if resp2.status_code < 400:
+                    return resp2.text or ""
+            except Exception:
+                pass
+
+        return ""
 
     def _parse_rsi_from_html(self, html: str) -> float | None:
         if not html:
@@ -168,23 +261,25 @@ class Sp500RsiProvider(Provider):
             value=v,
             unit="0-100",
             source="Investtech",
-            meta={"url": self.INVESTTECH_URL},
+            meta={"url": self.INVESTTECH_URL, "timeframe": "1D"},
         )
 
     def _fetch_investing(self) -> Observation | None:
-        html = self._get(self.INVESTING_URL, referer="https://www.investing.com/")
-        # 只接受 “RSI(14) ... Buy/Sell/Neutral” 这一行里的 Value，避免误抓页面其它数字。
-        v = self._parse_investing_rsi14_value(html)
-        if v is None:
-            return None
-        return Observation(
-            indicator_id=IndicatorId.SP500_RSI,
-            as_of=date.today(),
-            value=v,
-            unit="0-100",
-            source="Investing.com",
-            meta={"url": self.INVESTING_URL},
-        )
+        for u in self.INVESTING_DAILY_URLS:
+            html = self._get(u, referer="https://www.investing.com/")
+            # 只接受 RSI(14) 的 Value
+            v = self._parse_investing_rsi14_value(html)
+            if v is None:
+                continue
+            return Observation(
+                indicator_id=IndicatorId.SP500_RSI,
+                as_of=date.today(),
+                value=v,
+                unit="0-100",
+                source="Investing.com",
+                meta={"url": u, "timeframe": "1D"},
+            )
+        return None
 
     def _fetch_tradingview(self) -> Observation | None:
         html = self._get(self.TRADINGVIEW_URL, referer="https://www.tradingview.com/")
@@ -197,5 +292,5 @@ class Sp500RsiProvider(Provider):
             value=v,
             unit="0-100",
             source="TradingView",
-            meta={"url": self.TRADINGVIEW_URL},
+            meta={"url": self.TRADINGVIEW_URL, "timeframe": "1D"},
         )
