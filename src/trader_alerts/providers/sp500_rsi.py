@@ -92,18 +92,18 @@ class Sp500RsiProvider(Provider):
         if not html:
             return None
 
-        # 优先：严格匹配整行，避免误抓 RSI(14) 附近其它数字
-        # 典型结构（表格行）：
-        # <td>RSI(14)</td><td>69.858</td><td>Buy</td>
+        # 优先：匹配表格整行，提取 RSI(14) 后第一列 value。
+        # 只要求存在第三列（action）但不强限制其文本，避免页面把 Buy/Sell
+        # 改成 Strong Buy / Strong Sell 后导致解析失效。
+        # 典型结构：
+        # <td>RSI(14)</td><td>69.858</td><td>Strong Buy</td>
         m = re.search(
             r"RSI\s*\(\s*14\s*\)\s*"
             r"</td>\s*"
             r"<td[^>]*>\s*"
             r"([0-9]{1,3}(?:\.[0-9]+)?)\s*"
             r"</td>\s*"
-            r"<td[^>]*>\s*"
-            r"(Buy|Sell|Neutral)\s*"
-            r"</td>",
+            r"<td[^>]*>.*?</td>",
             html,
             re.IGNORECASE | re.DOTALL,
         )
@@ -119,9 +119,7 @@ class Sp500RsiProvider(Provider):
             r"<td[^>]*>.*?"
             r"([0-9]{1,3}(?:\.[0-9]+)?)"
             r".*?</td>\s*"
-            r"<td[^>]*>.*?"
-            r"(Buy|Sell|Neutral)"
-            r".*?</td>",
+            r"<td[^>]*>.*?</td>",
             html,
             re.IGNORECASE | re.DOTALL,
         )
@@ -133,8 +131,7 @@ class Sp500RsiProvider(Provider):
         # 再兜底：如果页面把表格数据塞在脚本 JSON 里（key/value/action）
         m = re.search(
             r"RSI\s*\(\s*14\s*\).*?"
-            r"(?:\"value\"|value|data-value)\s*[:=]\s*\"?([0-9]{1,3}(?:\.[0-9]+)?)\"?.*?"
-            r"(?:\"action\"|action)\s*[:=]\s*\"?(Buy|Sell|Neutral)\"?",
+            r"(?:\"value\"|value|data-value)\s*[:=]\s*\"?([0-9]{1,3}(?:\.[0-9]+)?)\"?",
             html,
             re.IGNORECASE | re.DOTALL,
         )
@@ -196,5 +193,4 @@ class Sp500RsiProvider(Provider):
             source="TradingView",
             meta={"url": self.TRADINGVIEW_URL},
         )
-
 
