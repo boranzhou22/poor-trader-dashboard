@@ -96,6 +96,69 @@ class Sp500RsiProvider(Provider):
         text = (resp.text or "").strip()
         if not text or text.lower().startswith("no data"):
             return None
+        deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+        gains = [max(d, 0.0) for d in deltas]
+        losses = [max(-d, 0.0) for d in deltas]
+
+        period = 14
+        avg_gain = sum(gains[:period]) / period
+        avg_loss = sum(losses[:period]) / period
+
+        for i in range(period, len(gains)):
+            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+        if 0 <= rsi <= 100:
+            return rsi
+        return None
+
+    def _fetch_stooq_rsi(self) -> Observation | None:
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "text/csv,text/plain,*/*",
+            "Accept-Encoding": "identity",
+        }
+        params = {"s": "^spx", "i": "d"}
+        resp = self.session.get(self.STOOQ_DAILY_URL, params=params, headers=headers, timeout=(5, 12))
+        if resp.status_code >= 400:
+            return None
+        text = (resp.text or "").strip()
+        if not text or text.lower().startswith("no data"):
+            return None
+
+        closes: list[float] = []
+        last_as_of: date | None = None
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        for line in lines[1:]:
+            parts = line.split(",")
+            if len(parts) < 5:
+                continue
+            try:
+                d = date.fromisoformat(parts[0])
+                c = float(parts[4])
+            except Exception:
+                continue
+            last_as_of = d
+            closes.append(c)
+
+        if not last_as_of:
+            return None
+        rsi = self._compute_rsi14(closes)
+        if rsi is None:
+            return None
+
+        return Observation(
+            indicator_id=IndicatorId.SP500_RSI,
+            as_of=last_as_of,
+            value=rsi,
+            unit="0-100",
+            source="Stooq(calc)",
+            meta={"url": self.STOOQ_DAILY_URL, "symbol": "^spx", "method": "wilder_rsi14"},
+        )
 
         closes: list[float] = []
         last_as_of: date | None = None
@@ -179,6 +242,52 @@ class Sp500RsiProvider(Provider):
                 if 0 <= v <= 100:
                     return v
         return None
+
+    def _parse_tradingview_rsi14_value(self, html: str) -> tuple[float | None, dict[str, str]]:
+        """
+        TradingView: strictly match the RSI(14) row/value, avoid broad numeric grabs.
+        Returns (value, debug_meta).
+        """
+        if not html:
+            return (None, {"tv_match": "empty_html"})
+
+        patterns: list[tuple[str, str]] = [
+            (
+                "tv_row_td_exact",
+                r"Relative\s+Strength\s+Index\s*\(\s*14\s*\)\s*"
+                r"</[^>]+>\s*"
+                r"<[^>]+>\s*([0-9]{1,3}(?:\.[0-9]+)?)\s*</[^>]+>",
+            ),
+            (
+                "tv_row_rsi14_td",
+                r"RSI\s*\(\s*14\s*\)\s*"
+                r"</[^>]+>\s*"
+                r"<[^>]+>\s*([0-9]{1,3}(?:\.[0-9]+)?)\s*</[^>]+>",
+            ),
+            (
+                "tv_json_title_value",
+                r"Relative\s+Strength\s+Index\s*\(\s*14\s*\).*?"
+                r"(?:\"value\"|value)\s*[:=]\s*\"?([0-9]{1,3}(?:\.[0-9]+)?)\"?",
+            ),
+            (
+                "tv_json_name_value",
+                r"(?:\"name\"|name)\s*[:=]\s*\"?Relative\s+Strength\s+Index\s*\(\s*14\s*\)\"?.*?"
+                r"(?:\"value\"|value)\s*[:=]\s*\"?([0-9]{1,3}(?:\.[0-9]+)?)\"?",
+            ),
+        ]
+
+        for tag, p in patterns:
+            m = re.search(p, html, re.IGNORECASE | re.DOTALL)
+            if not m:
+                continue
+            try:
+                v = float(m.group(1))
+            except Exception:
+                continue
+            if 0 <= v <= 100:
+                return (v, {"tv_match": tag, "tv_value_raw": m.group(1)})
+
+        return (None, {"tv_match": "no_rsi14_row_match"})
 
     def _parse_investing_rsi14_value(self, html: str) -> float | None:
         """
@@ -283,7 +392,7 @@ class Sp500RsiProvider(Provider):
 
     def _fetch_tradingview(self) -> Observation | None:
         html = self._get(self.TRADINGVIEW_URL, referer="https://www.tradingview.com/")
-        v = self._parse_rsi_from_html(html)
+        v, dbg = self._parse_tradingview_rsi14_value(html)
         if v is None:
             return None
         return Observation(
@@ -292,5 +401,5 @@ class Sp500RsiProvider(Provider):
             value=v,
             unit="0-100",
             source="TradingView",
-            meta={"url": self.TRADINGVIEW_URL, "timeframe": "1D"},
+            meta={"url": self.TRADINGVIEW_URL, "timeframe": "1D", **dbg},
         )
